@@ -1,8 +1,7 @@
 import pandas as pd
 import pickle
 import torch
-import torchani
-import torchani_mod
+
 import qcelemental as qcel
 import numpy as np
 from tqdm import tqdm
@@ -14,7 +13,21 @@ from torch_geometric.loader import DataLoader
 from helpers import model_dict
 import argparse
 import time
+import sys
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed 
 
+import multiprocessing
+from functools import partial
+
+
+# Suppress Torchani warnings
+warnings.filterwarnings("ignore", message="cuaev not installed")
+warnings.filterwarnings("ignore", message="Dependency not satisfied, torchani.ase will not be available")
+warnings.filterwarnings("ignore", message="Dependency not satisfied, torchani.data will not be available")
+
+import torchani
+import torchani_mod
 
 def elements_to_atomicnums(elements):
     atomicnums = np.zeros(len(elements), dtype=int)
@@ -260,6 +273,14 @@ def predict(model, device, loader, y_scaler=None):
 
     return total_graph_ids.cpu().numpy().flatten(), y_scaler.inverse_transform(total_preds.cpu().detach().numpy().flatten().reshape(-1,1)).flatten()
 
+ # Define a helper function to validate a single row.
+def validate_row(row, atom_keys):
+    try:
+        # Try loading the PDB file.
+        LoadPDBasDF(row["pdb_file"], atom_keys)
+        return None  # Return None if no exception occurs.
+    except Exception:
+        return row["unique_id"]  # Return the unique id on failure.
 
 def process_data(config):
 
@@ -276,7 +297,7 @@ def process_data(config):
     allowed_elements = set(['F', 'N', 'Cl', 'O', 'Br', 'C', 'B', 'P', 'I', 'S'])
     non_readable = []
     rare_atoms_ids = []
-    for index, row in tqdm(df.iterrows()):
+    for index, row in tqdm(df.iterrows(), total=df.shape[0]):
         suppl = Chem.SDMolSupplier(row["sdf_file"], removeHs=False)
         assert(len(suppl) == 1)
         lig = suppl[0]
@@ -296,26 +317,40 @@ def process_data(config):
     """
     Check what protein structures are readible by Biopandas
     """
-    print("Checking what protein structures are readible by Biopandas\n")
-    atom_keys = pd.read_csv("data/PDB_Atom_Keys.csv", sep=",")
-    atom_keys["RESIDUE"] = atom_keys["PDB_ATOM"].apply(lambda x: x.split("-")[0])
-    non_readable = []
-    for index, row in tqdm(df.iterrows()):
-        try:
-            LoadPDBasDF(row["pdb_file"], atom_keys)
-        except:
-            non_readable.append(row["unique_id"])
+    if not config.skip_validation:
 
-    print("Number of pdb files not read by Biopandas:",len(non_readable))
-    df = df[~df["unique_id"].isin(non_readable)].reset_index(drop=True)
-    print("\n")
+        print("Checking what protein structures are readible by Biopandas\n")
+        atom_keys = pd.read_csv("data/PDB_Atom_Keys.csv", sep=",")
+        atom_keys["RESIDUE"] = atom_keys["PDB_ATOM"].apply(lambda x: x.split("-")[0])
+
+
+        # Convert dataframe rows to a list of dictionaries (or use .to_dict("records"))
+        rows = df.to_dict("records")
+
+        # Use a partial function to pass the atom_keys variable to the validate_row function
+        validate_with_keys = partial(validate_row, atom_keys=atom_keys)
+    
+        # Process the rows in parallel using ProcessPoolExecutor.
+        with ProcessPoolExecutor(max_workers=config.num_workers) as executor:
+            # executor.map applies the function to each row.
+            results = list(tqdm(executor.map(validate_with_keys, rows), total=len(rows)))
+    
+        # Filter out None values to get the list of non-readable IDs.
+        non_readable = [r for r in results if r is not None]
+        
+        print("Number of pdb files not read by Biopandas:",len(non_readable))
+        df = df[~df["unique_id"].isin(non_readable)].reset_index(drop=True)
+        print("\n")
+
+    else:
+        print("Skipping Biopandas validation..\n")
 
     """
     Analyse atom features
     """
     print("Analyse atom features\n")
     features = []
-    for index, row in tqdm(df.iterrows()):
+    for index, row in tqdm(df.iterrows(), total=df.shape[0]):
         suppl = Chem.SDMolSupplier(row["sdf_file"], removeHs=False)
         lig = suppl[0]
         for atom in lig.GetAtoms():
@@ -357,7 +392,7 @@ def process_data(config):
     print("Edge analysis\n")
     bond_types = []
     unspecified_bond_mol = []
-    for index, row in tqdm(df.iterrows()):
+    for index, row in tqdm(df.iterrows(), total=df.shape[0]):
         suppl = Chem.SDMolSupplier(row["sdf_file"], removeHs=False)
         lig = suppl[0]
 
@@ -392,6 +427,21 @@ def process_data(config):
     df.to_csv(new_dataset_csv, index=False)
     print("\n")
 
+def process_single_graph(row_dict, atom_keys, radial_coefs, atom_map):
+    
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+    
+    sdf_file = row_dict["sdf_file"]
+    pdb_file = row_dict["pdb_file"]
+    unique_id = row_dict["unique_id"]
+    suppl = Chem.SDMolSupplier(sdf_file, removeHs=False)
+    lig = suppl[0]
+    mol_df, aevs = GetMolAEVs_extended(pdb_file, lig, atom_keys, radial_coefs, atom_map)
+    graph = mol_to_graph(lig, mol_df, aevs)
+    return unique_id, graph
+    
 def generate_graphs(config):
 
     """
@@ -417,15 +467,19 @@ def generate_graphs(config):
     radial_coefs = [RcR, EtaR, RsR]
 
     mol_graphs = {}
-    for index, row in tqdm(df.iterrows()):
-        suppl = Chem.SDMolSupplier(row["sdf_file"], removeHs=False)
-        lig = suppl[0]
-
-        protein_path = row["pdb_file"]
-
-        mol_df, aevs = GetMolAEVs_extended(protein_path, lig, atom_keys, radial_coefs, atom_map)
-        graph = mol_to_graph(lig, mol_df, aevs)
-        mol_graphs[row["unique_id"]] = graph
+    rows = [row.to_dict() for index, row in df.iterrows()]
+    num_workers = config.num_workers
+    
+    print(f"Using {num_workers} workers for graph generation.")
+    
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_single_graph, row, atom_keys, radial_coefs, atom_map) for row in rows]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Generating graphs"):
+            try:
+                unique_id, graph = future.result()
+                mol_graphs[unique_id] = graph
+            except Exception as e:
+                print("Error processing a graph:", e)
 
     #save the graphs to use as input for the GNN models
     output_file_graphs = "data/" + config.data_name + "_graphs.pickle"
@@ -434,7 +488,6 @@ def generate_graphs(config):
 
 
     t2 = time.time()
-    print("Time to generate graphs:", t2-t)
 
 
 def make_predictions(config):
@@ -443,6 +496,11 @@ def make_predictions(config):
     """
     print("Make predictions\n")
 
+    # Use all threads again
+    os.environ["OMP_NUM_THREADS"] = str(config.num_workers)
+    os.environ["MKL_NUM_THREADS"] = str(config.num_workers)
+    torch.set_num_threads(config.num_workers)
+    
     model_name = config.trained_model_name
     
 
@@ -475,16 +533,11 @@ def make_predictions(config):
     modeling = model_dict['GATv2Net']
     model = modeling(node_feature_dim=test_data.num_node_features, edge_feature_dim=test_data.num_edge_features, config=config)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    print(f"Using device: {device}")
-
-
     for i in range(10):
         model_path = 'output/trained_models/' + config.trained_model_name + '_' + str(i) + '.model'
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=config.device))
 
-        graph_ids_test, P_test = predict(model, device, test_loader, scaler)
+        graph_ids_test, P_test = predict(model, config.device, test_loader, scaler)
 
         if(i == 0):
             df_test = pd.DataFrame(data=graph_ids_test, index=range(len(graph_ids_test)), columns=['graph_id'])
@@ -511,12 +564,42 @@ def parse_args():
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--head', type=int, default=3)
     parser.add_argument('--activation_function', type=str, default='leaky_relu')
+    parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for graph generation')
+    parser.add_argument('--device', type=str, default='auto', help='Device for computation: "auto" (use CUDA if available), "cpu" (force CPU), or a specific CUDA device index (e.g., "0").')
+    parser.add_argument('--skip_validation', action='store_true',help='Bypass Biopandas validation of protein structures.')
+    
     args = parser.parse_args()
     return args
-
+    
+def get_device(device_param):
+    if device_param.lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif device_param.lower() == "cpu":
+        return torch.device("cpu")
+    else:
+        # Assume the user provided a valid CUDA device index
+        if int(device_param) >= torch.cuda.device_count():
+            sys.exit(f"The CUDA device {device_param} doesn't seem to exist!")
+        else:
+            return torch.device(f"cuda:{device_param}")
 
 if __name__ == "__main__":    
     config = parse_args()
+
+    # If num_workers is 0 or negative, set it to the available cores
+    if config.num_workers <= 0:
+        config.num_workers = os.cpu_count()
+        print(f"Using all available cores: {config.num_workers} workers.")
+    else:
+        print(f"Using {config.num_workers} worker(s).")
+        
+    # Configure actually using the correct amount of cores
+    os.environ["OMP_NUM_THREADS"] = str(config.num_workers)
+    os.environ["MKL_NUM_THREADS"] = str(config.num_workers)
+    torch.set_num_threads(config.num_workers)
+
+    config.device = get_device(config.device)
+    print(f"Using device: {config.device}")
     
     process_data(config)
     t1 = time.time()
@@ -525,4 +608,3 @@ if __name__ == "__main__":
     make_predictions(config)
     print("Total time to generate graphs and make predictions is %s seconds" % (time.time() - t1))
     
-
